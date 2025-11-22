@@ -17,9 +17,12 @@ import {
   Key,
   Settings,
 } from 'lucide-react';
+
+// 使用 npm 模块导入路径 
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
 import { getFirestore } from 'firebase/firestore';
+
 
 // --- 常量与配置 ---
 const APP_NAME = "LinguistAI 灵犀写作";
@@ -48,12 +51,42 @@ const cleanJsonString = (text) => {
     if (cleaned.startsWith('```json')) {
         cleaned = cleaned.substring(7).trim();
     }
+    // 兼容模型可能返回的其它语言标记
+    if (cleaned.startsWith('```json\n')) { 
+        cleaned = cleaned.substring(8).trim(); 
+    } else if (cleaned.startsWith('```')) {
+        cleaned = cleaned.substring(3).trim();
+    }
+    
     if (cleaned.endsWith('```')) {
         cleaned = cleaned.substring(0, cleaned.length - 3).trim();
     }
     return cleaned;
 };
 
+// 复制到剪贴板的降级函数
+const fallbackCopyTextToClipboard = (text, messageKey, setCopiedMessage, setErrorMessage) => {
+    try {
+      const textArea = document.createElement('textarea');
+      textArea.value = text;
+      textArea.style.position = 'fixed';
+      textArea.style.left = '-9999px';
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+
+      if (document.execCommand('copy')) {
+        setCopiedMessage(messageKey);
+        setTimeout(() => setCopiedMessage(null), 2000);
+      } else {
+        setErrorMessage('复制失败，请手动复制。');
+      }
+      document.body.removeChild(textArea);
+    } catch (err) {
+      console.error('Copy failed (fallback):', err);
+      setErrorMessage('复制失败，请手动复制。');
+    }
+};
 
 // --- API 交互逻辑 ---
 
@@ -111,7 +144,7 @@ const transcribeImage = async (base64Image, mimeType, currentApiKey, setErrorMes
     }
 };
 
-// 2. 润色与分析 (FIXED: Added JSON cleanup)
+// 2. 润色与分析 (FIXED: Added JSON cleanup and structural check)
 const fetchImprovedText = async (text, analysisTarget, difficulty, userPrompt, currentApiKey, setErrorMessage) => {
   const apiKey = currentApiKey || "";
   const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${apiKey}`;
@@ -229,10 +262,17 @@ Please provide a structured response in the following JSON format.`;
           throw new Error("Received empty or malformed response from API.");
         }
         
-        // --- FIX: Clean the string before parsing ---
+        // 1. 清理字符串
         const jsonToParse = cleanJsonString(rawJsonString);
         
+        // 2. 尝试解析 JSON
         const parsedJson = JSON.parse(jsonToParse);
+        
+        // 3. 严格检查 JSON 结构是否完整 (新增的防御性检查)
+        if (!parsedJson.summary || !Array.isArray(parsedJson.issues) || typeof parsedJson.improved_full_text !== 'string') {
+            throw new Error("Parsed JSON is structurally invalid (missing summary, issues array, or improved_full_text string).");
+        }
+
         return parsedJson;
 
       } catch (error) {
@@ -243,9 +283,9 @@ Please provide a structured response in the following JSON format.`;
         } else {
             console.error("Revision API Call failed after all retries:", error);
             if (error.message.includes("400")) {
-              setErrorMessage("API 请求失败 (状态码 400)。请检查文本内容或模型设置。");
-            } else if (error.message.includes("JSON")) {
-              setErrorMessage("API 返回格式错误，请稍后重试。 (模型可能添加了额外的Markdown符号)");
+              setErrorMessage("API 请求失败 (状态码 400)。请检查文本内容或 API Key。");
+            } else if (error.message.includes("JSON") || error.message.includes("structurally invalid")) {
+              setErrorMessage("API 返回格式错误，请稍后重试。 (模型可能返回了非法的 JSON 结构)");
             } else {
               setErrorMessage(`润色请求失败：${error.message}`);
             }
@@ -283,12 +323,13 @@ export default function App() {
   
   // 1. Firebase 初始化与认证 (Mandatory Setup)
   useEffect(() => {
+    // 检查 Canvas 提供的全局变量是否存在，并提供本地默认值
     const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
     const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
     const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
     if (!firebaseConfig) {
-        console.error("Firebase configuration not available.");
+        // 在本地 Vite 环境中，这些全局变量不存在，但我们不需要它们来运行核心功能。
         setAuthReady(true);
         return;
     }
@@ -296,7 +337,6 @@ export default function App() {
     try {
         const app = initializeApp(firebaseConfig);
         const auth = getAuth(app);
-        const db = getFirestore(app); 
         authRef.current = auth; 
 
         const signIn = async () => {
@@ -315,6 +355,7 @@ export default function App() {
             if (user) {
                 setUserId(user.uid);
             } else {
+                // If anonymous sign-in failed, use a random UUID as fallback
                 setUserId(crypto.randomUUID()); 
             }
             setAuthReady(true);
@@ -334,30 +375,22 @@ export default function App() {
    * @param {string} messageKey 提示信息的唯一键。
    */
   const copyToClipboard = useCallback((text, messageKey) => {
-    try {
-      // 使用 document.execCommand('copy') 作为 iframe 环境下的兼容方案
-      const textArea = document.createElement('textarea');
-      textArea.value = text;
-      // 使其不可见，但仍可选择
-      textArea.style.position = 'fixed';
-      textArea.style.left = '-9999px';
-      document.body.appendChild(textArea);
-      textArea.select();
-
-      // 检查浏览器是否支持
-      if (document.execCommand('copy')) {
-        document.execCommand('copy');
-        setCopiedMessage(messageKey);
-        setTimeout(() => setCopiedMessage(null), 2000);
-      } else {
-        console.warn('Fallback copy method failed.');
-      }
-      document.body.removeChild(textArea);
-    } catch (err) {
-      console.error('Copy failed:', err);
-      setErrorMessage('复制失败，请手动复制。');
+    // 使用 modern API
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text)
+        .then(() => {
+          setCopiedMessage(messageKey);
+          setTimeout(() => setCopiedMessage(null), 2000);
+        })
+        .catch(err => {
+          console.error('Copy failed using clipboard API:', err);
+          // 降级到旧方法
+          fallbackCopyTextToClipboard(text, messageKey, setCopiedMessage, setErrorMessage);
+        });
+    } else {
+      fallbackCopyTextToClipboard(text, messageKey, setCopiedMessage, setErrorMessage);
     }
-  }, []);
+  }, [setCopiedMessage, setErrorMessage]); // 确保依赖项完整
 
   const handleTranscribe = () => {
     fileInputRef.current.click();
@@ -439,7 +472,8 @@ export default function App() {
           <h1 className="text-xl font-bold text-indigo-600 flex items-center gap-2">
             <GraduationCap className="w-6 h-6" />
             {APP_NAME}
-            {userId && <span className="text-xs font-mono text-slate-400 ml-2">UID: {userId}</span>}
+            {/* 仅在 authReady 且 userId 存在时显示 */}
+            {authReady && userId && <span className="text-xs font-mono text-slate-400 ml-2">UID: {userId}</span>}
           </h1>
           <button 
             onClick={() => setShowSettings(!showSettings)}
@@ -664,7 +698,7 @@ export default function App() {
                   </button>
                   <button onClick={() => setActiveTab('issues')} className={tabClasses('issues')}>
                     <Highlighter size={16} className="inline mr-1" />
-                    问题与修正 ({result.issues.length})
+                    问题与修正 ({result.issues ? result.issues.length : 0})
                   </button>
                   <button onClick={() => setActiveTab('revised')} className={tabClasses('revised')}>
                     <Eraser size={16} className="inline mr-1" />
@@ -675,7 +709,7 @@ export default function App() {
 
               <div className="p-6">
                 {/* 1. 总结与评估 */}
-                {activeTab === 'summary' && (
+                {activeTab === 'summary' && result.summary && (
                   <div className="space-y-4">
                     <div className="p-4 bg-indigo-50 rounded-xl border border-indigo-200">
                       <h3 className="text-sm font-semibold text-indigo-700 mb-2 flex items-center">
@@ -712,7 +746,7 @@ export default function App() {
                 )}
 
                 {/* 2. 问题与修正 */}
-                {activeTab === 'issues' && (
+                {activeTab === 'issues' && result.issues && (
                   <div className="space-y-4 max-h-[500px] overflow-y-auto custom-scrollbar">
                     {result.issues.length === 0 ? (
                       <div className="p-4 text-center text-slate-500 bg-gray-50 rounded-xl">
@@ -759,7 +793,7 @@ export default function App() {
                 )}
 
                 {/* 3. 全文润色 */}
-                {activeTab === 'revised' && (
+                {activeTab === 'revised' && result.improved_full_text && (
                   <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm">
                     <p className="text-slate-700 leading-loose whitespace-pre-wrap">
                       {result.improved_full_text}
